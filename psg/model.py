@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import math
+import torch
 from torch.utils.data import DataLoader
 from psg.layer import *
 from psg.loss import *
@@ -49,7 +50,7 @@ class BaseModel(object):
     def __init__(self, lr, dropout, grad_clip_norm, gnn_num_layers, mlp_num_layers, emb_hidden_channels,
                  gnn_hidden_channels, mlp_hidden_channels, num_nodes, num_node_feats, gnn_encoder_name,
                  predictor_name, loss_func, optimizer_name, device, use_node_feats, train_node_emb,
-                 edge_attr=None, emb_ea=None, pretrain_emb=None):
+                 edge_attr=None, emb_ea=None, pretrain_emb=None, labels=None):
         self.loss_func_name = loss_func
         self.num_nodes = num_nodes
         self.num_node_feats = num_node_feats
@@ -60,6 +61,9 @@ class BaseModel(object):
         self.gnn_encoder_name = gnn_encoder_name
         self.edge_attr = edge_attr
         self.emb_ea = emb_ea
+        self.labels = labels.to(device)
+        self.cluster_num = torch.unique(labels).size(0)
+        self.labelLambda = 0.5
 
         # Input Layer
         self.input_channels, self.emb = create_input_layer(num_nodes=num_nodes,
@@ -92,6 +96,12 @@ class BaseModel(object):
         if self.emb_ea is not None:
             self.para_list += list(self.emb_ea.parameters())
 
+        # Label Predict Layer
+        if self.cluster_num > 1:
+            self.labelPredictor = MLPLabelPredictor(mlp_hidden_channels, mlp_hidden_channels, self.cluster_num, mlp_num_layers,
+                                                dropout).to(device)
+            self.para_list += list(self.labelPredictor.parameters())
+
         if optimizer_name == 'AdamW':
             self.optimizer = torch.optim.AdamW(self.para_list, lr=lr)
         elif optimizer_name == 'SGD':
@@ -102,6 +112,8 @@ class BaseModel(object):
     def param_init(self):
         self.encoder.reset_parameters()
         self.predictor.reset_parameters()
+        if self.cluster_num > 1:
+            self.labelPredictor.reset_parameters()
         if self.emb is not None:
             torch.nn.init.xavier_uniform_(self.emb.weight)
         if self.emb_ea is not None:
@@ -140,6 +152,8 @@ class BaseModel(object):
     def train(self, data, split_edge, batch_size, neg_sampler_name, num_neg, adj_t):
         self.encoder.train()
         self.predictor.train()
+        if self.cluster_num > 1:
+            self.labelPredictor.train()
 
         pos_train_edge, neg_train_edge = get_pos_neg_edges('train', split_edge,
                                                            edge_index=data.edge_index,
@@ -173,11 +187,24 @@ class BaseModel(object):
             weight_margin = edge_weight_margin[perm] if edge_weight_margin is not None else None
 
             loss = self.calculate_loss(pos_out, neg_out, num_neg, margin=weight_margin)
+            if self.cluster_num > 1:
+                label_out0 = self.labelPredictor(h[pos_edge[0]])
+                label_out1 = self.labelPredictor(h[pos_edge[1]])
+                label_out_pos = label_out0 * label_out1
+                labels0 = self.labels[pos_edge[0]]
+                labels_pos = labels0
+                criteria = torch.nn.CrossEntropyLoss()
+                label_loss_pos = criteria(label_out_pos, labels_pos)
+                label_loss = label_loss_pos
+                loss = self.labelLambda * label_loss + (1.0 - self.labelLambda) * loss
+
             loss.backward()
 
             if self.clip_norm >= 0:
                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.clip_norm)
                 torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), self.clip_norm)
+                if self.cluster_num > 1:
+                    torch.nn.utils.clip_grad_norm_(self.labelPredictor.parameters(), self.clip_norm)
 
             self.optimizer.step()
 
@@ -200,6 +227,8 @@ class BaseModel(object):
     def test(self, data, split_edge, batch_size, evaluator, eval_metric, adj_t):
         self.encoder.eval()
         self.predictor.eval()
+        if self.cluster_num > 1:
+            self.labelPredictor.eval()
 
         input_feat = self.create_input_feat(data)
         if self.gnn_encoder_name.upper() == 'SAGE-EDGE':
@@ -292,6 +321,8 @@ def create_predictor_layer(hidden_channels, num_layers, dropout=0, predictor_nam
         return BilinearPredictor(hidden_channels)
     elif predictor_name == 'MLP':
         return MLPPredictor(hidden_channels, hidden_channels, 1, num_layers, dropout)
+    elif predictor_name == 'MLPHIST':
+        return MLPHistPredictor(hidden_channels, hidden_channels, 1, num_layers, dropout)
     elif predictor_name == 'MLPDOT':
         return MLPDotPredictor(hidden_channels, 1, num_layers, dropout)
     elif predictor_name == 'MLPBIL':

@@ -10,6 +10,9 @@ from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 from psg.logger import Logger
 from psg.model import BaseModel, adjust_lr
 from torch_geometric.utils import negative_sampling, to_networkx, to_undirected
+from torch_sparse import coalesce, SparseTensor
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.metrics import silhouette_samples, silhouette_score
 
 
 def argument():
@@ -52,6 +55,11 @@ def argument():
     parser.add_argument('--random_walk_augment', type=str2bool, default=False)
     parser.add_argument('--num_samples', type=int, default=5)
     parser.add_argument('--node_emb', type=int, default=256)
+    parser.add_argument('--relay_seeds', type=int, default=500)
+    parser.add_argument('--relay_samples', type=int, default=200)
+    parser.add_argument('--use_forman_ricci', type=str2bool, default=False)
+    parser.add_argument('--use_edge_simattr', type=str2bool, default=False)
+    parser.add_argument('--use_cluster_label', type=str2bool, default=False)
     args = parser.parse_args()
     return args
 
@@ -74,6 +82,51 @@ def get_spd_matrix(G, S, max_spd=5):
             spd_matrix[node, i] = min(length, max_spd)
     return spd_matrix
 
+def mbkmeans_clusters(
+    X,
+    k,
+    mb,
+    print_silhouette_values,
+):
+    """Generate clusters and print Silhouette metrics using MBKmeans
+
+    Args:
+        X: Matrix of features.
+        k: Number of clusters.
+        mb: Size of mini-batches.
+        print_silhouette_values: Print silhouette values per cluster.
+
+    Returns:
+        Trained clustering model and labels based on X.
+    """
+    km = MiniBatchKMeans(n_clusters=k, batch_size=mb).fit(X)
+    print(f"For n_clusters = {k}")
+    print(f"Silhouette coefficient: {silhouette_score(X, km.labels_):0.2f}")
+    print(f"Inertia:{km.inertia_}")
+
+    if print_silhouette_values:
+        sample_silhouette_values = silhouette_samples(X, km.labels_)
+        print(f"Silhouette values:")
+        silhouette_values = []
+        for i in range(k):
+            cluster_silhouette_values = sample_silhouette_values[km.labels_ == i]
+            silhouette_values.append(
+                (
+                    i,
+                    cluster_silhouette_values.shape[0],
+                    cluster_silhouette_values.mean(),
+                    cluster_silhouette_values.min(),
+                    cluster_silhouette_values.max(),
+                )
+            )
+        silhouette_values = sorted(
+            silhouette_values, key=lambda tup: tup[2], reverse=True
+        )
+        for s in silhouette_values:
+            print(
+                f"    Cluster {s[0]}: Size:{s[1]} | Avg:{s[2]:.2f} | Min:{s[3]:.2f} | Max: {s[4]:.2f}"
+            )
+    return km, km.labels_
 
 def main():
     args = argument()
@@ -82,6 +135,54 @@ def main():
 
     dataset = PygLinkPropPredDataset(name=args.data_name, root=args.data_path)
     data = dataset[0]
+
+    if hasattr(data, 'num_features'):
+        num_node_feats = data.num_features
+    else:
+        num_node_feats = 0
+
+    if hasattr(data, 'num_nodes'):
+        num_nodes = data.num_nodes
+    else:
+        num_nodes = data.adj_t.size(0)
+
+    split_edge = dataset.get_edge_split()
+    if args.data_name == 'ogbl-collab':
+        # only train edges after specific year
+        if args.year > 0 and hasattr(data, 'edge_year'):
+            selected_year_index = torch.reshape(
+                (split_edge['train']['year'] >= args.year).nonzero(as_tuple=False), (-1,))
+            split_edge['train']['edge'] = split_edge['train']['edge'][selected_year_index]
+            split_edge['train']['weight'] = split_edge['train']['weight'][selected_year_index]
+            split_edge['train']['year'] = split_edge['train']['year'][selected_year_index]
+            train_edge_index = split_edge['train']['edge'].t()
+            # create adjacency matrix
+            new_edges = to_undirected(train_edge_index, split_edge['train']['weight'], reduce='add')
+            new_edge_index, new_edge_weight = new_edges[0], new_edges[1]
+            data.adj_t = SparseTensor(row=new_edge_index[0],
+                                      col=new_edge_index[1],
+                                      value=new_edge_weight.to(torch.float32))
+            data.edge_index = new_edge_index
+
+        # Use training + validation edges
+        if args.use_valedges_as_input:
+            val_edge_index = split_edge['valid']['edge'].t()
+            val_edge_index = to_undirected(val_edge_index)
+            data.edge_index = torch.cat([data.edge_index, val_edge_index], dim=-1)
+            val_edge_weight = torch.ones([val_edge_index.size(1), 1], dtype=int)
+            data.edge_weight = torch.cat([data.edge_weight, val_edge_weight], 0)
+
+            # edge weight normalization
+            # data.adj_t = SparseTensor(row=data.edge_index[0],
+            #                           col=data.edge_index[1],
+            #                           value=data.edge_weight.to(torch.float32))
+            # deg = data.adj_t.sum(dim=1).to(torch.float)
+            # deg_inv_sqrt = deg.pow(-0.5)
+            # deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+            # split_edge['train']['weight'] = deg_inv_sqrt[data.edge_index[0]] * data.edge_weight * deg_inv_sqrt[
+            #     data.edge_index[1]]
+
+
     edge_index = data.edge_index.to(device)
 
     print("edge_index: ", edge_index.size(-1), edge_index.size())
@@ -95,9 +196,9 @@ def main():
     nx_graph = to_networkx(data, to_undirected=True)
     node_mask = []
     for _ in range(args.num_samples):
-        node_mask.append(np.random.choice(500, size=200, replace=False))
+        node_mask.append(np.random.choice(args.relay_seeds, size=args.relay_samples, replace=False))
     node_mask = np.array(node_mask)
-    node_subset = np.random.choice(nx_graph.number_of_nodes(), size=500, replace=False)
+    node_subset = np.random.choice(nx_graph.number_of_nodes(), size=args.relay_seeds, replace=False)
     spd = get_spd_matrix(G=nx_graph, S=node_subset, max_spd=5)
     spd = torch.Tensor(spd).to(device)
 
@@ -107,23 +208,62 @@ def main():
     a_min = torch.min(edge_attr, dim=0, keepdim=True)[0]
     edge_attr = (edge_attr - a_min) / (a_max - a_min + 1e-6)
 
+    # cluster_num = 1
+    target = torch.zeros(num_nodes)
+    if args.data_name == 'ogbl-collab':
+        import pandas as pd
+        if args.use_forman_ricci:
+            from GraphRicciCurvature.FormanRicci import FormanRicci
+            G = to_networkx(data, to_undirected=True)
+            frc = FormanRicci(G)
+            frc.compute_ricci_curvature()
+            temp = [frc.G[edge_index[0][x].item()][edge_index[1][x].item()].get('formanCurvature') for x in
+                    range(edge_index[0, :].size(dim=0))]
+            temp = torch.tensor(temp)
+            edge_curvature_attr = torch.unsqueeze(temp, 1).to(device)
+
+            # a_max = torch.max(edge_curvature_attr, dim=0, keepdim=True)[0]
+            # a_min = torch.min(edge_curvature_attr, dim=0, keepdim=True)[0]
+            # edge_curvature_attr = (a_max - edge_curvature_attr + 1e-6) / (a_max - a_min + 1e-6)
+            edge_curvature_attr = torch.sigmoid(edge_curvature_attr)
+            edge_curvature_attr = torch.sub(1.0, edge_curvature_attr)
+            edge_attr = torch.cat((edge_attr, edge_curvature_attr), 1)
+            args.num_samples += 1
+            emb_ea = torch.nn.Embedding(args.num_samples, args.node_emb).to(device)
+
+        if args.use_edge_simattr:
+            # if hasattr(data, 'x'):
+            #     if data.x is not None:
+            #         node_features_matrix = data.x.to(torch.float)
+            node_features = pd.read_csv('./dataset/ogbl_collab/raw/node-feat.csv.gz', header=None, compression='gzip', error_bad_lines=False)
+            node_features_matrix = node_features.values
+            node_features_matrix = torch.Tensor(node_features_matrix).to(device)
+            src_node_feature_matrix = node_features_matrix[edge_index[0, :], :]
+            dst_node_feature_matrix = node_features_matrix[edge_index[1, :], :]
+            edge_sim_attr = src_node_feature_matrix * dst_node_feature_matrix
+            edge_attr = torch.cat((edge_attr, edge_sim_attr), 1)
+            edge_simattr_dim = edge_sim_attr.shape[1]
+            emb_ea = torch.nn.Embedding(args.num_samples + edge_simattr_dim, args.node_emb).to(device)
+
+        if args.use_cluster_label:
+            # if hasattr(data, 'x'):
+            #     if data.x is not None:
+            #         node_features_matrix = data.x.numpy().astype(np.float16)
+            # clustering, node_labels = mbkmeans_clusters(
+            #     X=node_features_matrix,
+            #     k=50,
+            #     mb=500,
+            #     print_silhouette_values=False,
+            # )
+            node_labels_raw = pd.read_csv('./node_label.csv', header=None, error_bad_lines=False)
+            node_labels = node_labels_raw.values
+            # cluster_num = np.unique(node_labels).size # torch.unique(node_labels_tensor).size(0)
+            target = torch.tensor(node_labels, dtype=torch.long)
+            target = target.squeeze(-1)
+
     if hasattr(data, 'edge_weight'):
         if data.edge_weight is not None:
             data.edge_weight = data.edge_weight.view(-1).to(torch.float)
-
-
-    if hasattr(data, 'num_features'):
-        num_node_feats = data.num_features
-    else:
-        num_node_feats = 0
-
-    if hasattr(data, 'num_nodes'):
-        num_nodes = data.num_nodes
-    else:
-        num_nodes = data.adj_t.size(0)
-
-    split_edge = dataset.get_edge_split()
-
     print(args)
 
     # create log file and save args
@@ -158,7 +298,8 @@ def main():
         train_node_emb=args.train_node_emb,
         edge_attr=edge_attr,
         emb_ea=emb_ea,
-        pretrain_emb=args.pretrain_emb
+        pretrain_emb=args.pretrain_emb,
+        labels=target
     )
 
     total_params = sum(p.numel() for param in model.para_list for p in param)
